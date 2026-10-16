@@ -119,6 +119,21 @@ jobs:
           "VCPKG_TARGET_TRIPLET=$triplet" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Get-ChildItem "$tree\lib" | Select-Object -ExpandProperty Name
 
+      - name: Diagnose toolchain and deps
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+          ninja --version
+          nvcc --version | Select-Object -Last 2
+          "VCPKG_ROOT=$env:VCPKG_ROOT"
+          "VCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET"
+          "CUDA_PATH=$env:CUDA_PATH"
+          Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}} | Format-List
+          $tree = "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET"
+          if (Test-Path $tree) { Get-ChildItem -Recurse -File $tree | Select-Object -First 40 -ExpandProperty FullName }
+          else { "MISSING: $tree" }
+          Get-ChildItem "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET\lib" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+
       - name: Configure
         shell: pwsh
         run: |
