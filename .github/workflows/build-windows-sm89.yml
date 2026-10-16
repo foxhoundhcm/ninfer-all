@@ -93,7 +93,8 @@ jobs:
           Expand-Archive -Path "$deps\curl.zip" -DestinationPath $deps
           $curl = (Get-ChildItem -Path $deps -Directory -Filter 'curl-*' | Select-Object -First 1).FullName
           New-Item -ItemType Directory -Force -Path "$tree\include\curl" | Out-Null
-          Copy-Item -Recurse -Path "$curl\include\*" -Destination "$tree\include\curl"
+          # 目标必须是 <tree>/include/curl/curl.h（本机 shim 实测）；直接拷 $curl\include\* 会写成 include/curl/curl/…
+          Copy-Item -Recurse -Path "$curl\include\curl\*" -Destination "$tree\include\curl"
           Copy-Item -Path "$curl\bin\libcurl-x64.dll" -Destination "$tree\bin"
 
           function New-MsvcImportLib([string]$dll, [string]$outLib) {
@@ -113,8 +114,13 @@ jobs:
           New-MsvcImportLib "$curl\bin\libcurl-x64.dll" "$tree\lib\libcurl.lib"
 
           # zlib：先放空 stub（本机实测 avformat 动态链接、无 inflate 引用）；若链接报未解析符号再改成真编 zlib 1.3.1
-          New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null
-
+          # zlib：runner 自带 vcpkg，取真头文件 + 真 zlib.lib（本机 shim 的 z.lib 是真库）
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --classic zlib:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg could not install zlib' }
+          $z = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          Copy-Item -Path "$z\include\zlib.h", "$z\include\zconf.h" -Destination "$tree\include"
+          if (Test-Path "$z\lib\zlib.lib") { Copy-Item "$z\lib\zlib.lib" "$tree\lib\z.lib" }
+          else { New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null }
           "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_TARGET_TRIPLET=$triplet" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Get-ChildItem "$tree\lib" | Select-Object -ExpandProperty Name
