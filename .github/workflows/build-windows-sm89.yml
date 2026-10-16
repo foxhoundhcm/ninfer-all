@@ -187,9 +187,28 @@ jobs:
             Copy-Item -Path 'build/bench/*.exe' -Destination $out
           }
           Copy-Item -Path "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET\bin\*.dll" -Destination $out
-          Get-ChildItem $out -File | ForEach-Object {
-            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-          } | Out-File -FilePath "$out/SHA256SUMS.txt" -Encoding ascii
+          # ⚠️ 两个坑（2026-10-16 run 38906774516 实测）：
+          #  1) Get-ChildItem 在管道里是惰性的：Out-File 收到第一个元素就打开 SHA256SUMS.txt，
+          #     而此刻枚举才真正执行 → 刚创建的 SHA256SUMS.txt 被列入 → Get-FileHash 去读一个
+          #     被 Out-File 占着写句柄的文件 → "The process cannot access the file ... being used by another process"
+          #     → 必须先把清单物化成数组，并显式排除 SHA256SUMS.txt
+          #  2) Windows Defender 会扫刚写出的大 exe 并短暂锁文件 → hash 套重试
+          function Get-RetryHash([string]$path) {
+            $tries = 0
+            while ($true) {
+              try { return (Get-FileHash $path -Algorithm SHA256).Hash.ToLower() }
+              catch {
+                $tries++
+                if ($tries -ge 15) { throw }
+                Start-Sleep -Seconds 2
+              }
+            }
+          }
+          $files = @(Get-ChildItem $out -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' })
+          $lines = foreach ($f in $files) { "$(Get-RetryHash $f.FullName)  $($f.Name)" }
+          $tmp = Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt"
+          $lines | Out-File -FilePath $tmp -Encoding ascii
+          Move-Item -Path $tmp -Destination "$out/SHA256SUMS.txt" -Force
 
       - uses: actions/upload-artifact@v7
         with:
