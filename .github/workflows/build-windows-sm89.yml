@@ -119,14 +119,21 @@ jobs:
           }
           New-MsvcImportLib "$curl\bin\libcurl-x64.dll" "$tree\lib\libcurl.lib"
 
-          # zlib：先放空 stub（本机实测 avformat 动态链接、无 inflate 引用）；若链接报未解析符号再改成真编 zlib 1.3.1
-          # zlib：runner 自带 vcpkg，取真头文件 + 真 zlib.lib（本机 shim 的 z.lib 是真库）
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --classic zlib:x64-windows
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg could not install zlib' }
-          $z = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
-          Copy-Item -Path "$z\include\zlib.h", "$z\include\zconf.h" -Destination "$tree\include"
-          if (Test-Path "$z\lib\zlib.lib") { Copy-Item "$z\lib\zlib.lib" "$tree\lib\z.lib" }
-          else { New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null }
+          # zlib：**必须**是真库 —— 0 字节 stub 会让 MSVC 报 `LNK1136: invalid or corrupt file`（2026-10-16 实测），
+          # 而 png_decode.cpp 真的 include zlib.h / 调 inflate。按本机配方从源码编 1.3.1（nmake 已在 VS 环境里）：
+          $zsrc = Join-Path $env:RUNNER_TEMP 'zlib-1.3.1'
+          Invoke-WebRequest -Uri 'https://github.com/madler/zlib/releases/download/v1.3.1/zlib131.zip' -OutFile "$env:RUNNER_TEMP\zlib131.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\zlib131.zip" -DestinationPath $env:RUNNER_TEMP -Force
+          Push-Location $zsrc
+          & nmake -nologo -f win32\Makefile.msc 'ZLIB_COMPAT=' 'LDFLAGS='
+          if ($LASTEXITCODE -ne 0) { throw "zlib build failed ($LASTEXITCODE)" }
+          Pop-Location
+          Copy-Item (Join-Path $zsrc 'zlib.lib') "$tree\lib\z.lib"
+          Copy-Item (Join-Path $zsrc 'zlib.h'), (Join-Path $zsrc 'zconf.h') -Destination "$tree\include" -Force
+          $zl = Get-Item "$tree\lib\z.lib"
+          "z.lib size = $($zl.Length) bytes"
+          if ($zl.Length -lt 1024) { throw "z.lib is empty ($($zl.Length) bytes): the link step would fail with LNK1136" }
+          & lib /nologo /list:"$tree\lib\z.lib" | Measure-Object -Line | ForEach-Object { "z.lib archive members = $($_.Lines)" }
           "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_TARGET_TRIPLET=$triplet" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Get-ChildItem "$tree\lib" | Select-Object -ExpandProperty Name
