@@ -31,6 +31,10 @@ on:
         default: both
         type: choice
         options: [both, apps, bench]
+      sccache_version:
+        description: sccache version to install (compile cache)
+        default: '0.18.0'
+        type: string
 
 jobs:
   build:
@@ -77,6 +81,29 @@ jobs:
             }
           }
           python -m pip install --quiet ninja
+
+      # 编译缓存：sccache 只拦 cl（C/C++ 编译单元），nvcc 不走它（sccache 不支持）→
+      # CUDA .cu 部分不缓存，主体 C++ 部分命中缓存。缓存目录放 D:（build 也在 D:），
+      # actions/cache 在 run 间保留（runner 本身每次干净）。
+      - name: Install sccache ${{ inputs.sccache_version }}
+        shell: pwsh
+        run: |
+          $ver = '${{ inputs.sccache_version }}'
+          # 只接受 x.y.z 版本号：该值会进 URL 和 PATH，白名单防注入
+          if ($ver -notmatch '^[0-9]+(\.[0-9]+)*$') { throw "refusing sccache version '$ver'" }
+          $zip = Join-Path $env:RUNNER_TEMP "sccache-v$ver.zip"
+          $url = "https://github.com/mozilla/sccache/releases/download/v$ver/sccache-v$ver-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath 'C:\sccache' -Force
+          $exe = Get-ChildItem -Path 'C:\sccache' -Recurse -Filter 'sccache.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'sccache.exe not found after extract' }
+          & $exe.FullName --version
+          "$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $cacheDir = 'D:\sccache-cache'
+          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+          "SCCACHE_DIR=$cacheDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # 构建结束即关 sccache server，别在 actions/cache 存档时还占着缓存文件句柄
+          "SCCACHE_IDLE_TIMEOUT=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # 依赖 shim：cmake/Dependencies.cmake 与 FindFFMPEG 把 VCPKG_ROOT + VCPKG_TARGET_TRIPLET 当硬前提，
       # 且只在该布局下找 av*.lib / 头文件 / DLL。FFmpeg 与 curl 的 MSVC import lib 从各自 DLL 的导出表现场造
@@ -165,15 +192,40 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_CUDA_ARCHITECTURES=89 "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
             -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DBUILD_TESTING=OFF `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=OFF -DCMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES=OFF `
             @flags
           if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
+
+      - name: Restore sccache cache
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\sccache-cache
+          key: sccache-sm89-${{ matrix.scope }}-${{ github.sha }}
+          restore-keys: |
+            sccache-sm89-${{ matrix.scope }}-
+            sccache-sm89-
 
       - name: Build
         shell: pwsh
         run: |
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+          # 防静默失效：launcher 没生效时 sccache 不会写缓存，构建照常全量编译、看起来一切正常
+          $stats = (& sccache --show-stats) -join "`n"
+          $stats
+          if ($stats -notmatch 'Cache misses\s+[1-9]') { throw "sccache wrote nothing to the cache: the CMAKE_*_COMPILER_LAUNCHER hook is not working" }
+          # 防"缓存了但依赖没跟踪"：sccache 靠 /showIncludes 解析 MSVC 依赖；缺了它缓存命中时
+          # 改头文件不触发重编 → 热缓存 run 可能编出陈旧对象。这里强制失败，别把风险留到下次
+          $cmds = (& ninja -C build -t commands) -join "`n"
+          if ($cmds -notmatch '/showIncludes') { throw "MSVC cl invocations lack /showIncludes: sccache cannot track dependencies; warm-cache builds would be unsafe" }
+
+      - name: Save sccache cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: D:\sccache-cache
+          key: sccache-sm89-${{ matrix.scope }}-${{ github.sha }}
 
       - name: Stage artifact
         shell: pwsh
