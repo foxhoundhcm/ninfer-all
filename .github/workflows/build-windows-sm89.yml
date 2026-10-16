@@ -23,7 +23,7 @@ on:
         default: 'cuda_13.1.0_windows_network.exe'
         type: string
       ref:
-        description: commit/branch to build (blank = the branch this runs on)
+        description: branch, tag or FULL 40-char SHA to build (blank = the commit that triggered this run)
         default: ''
         type: string
 
@@ -39,7 +39,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          # ⚠️ ref 必须是分支 / tag / 完整 40 位 SHA：给短 SHA 时 checkout 会把它当分支名去 fetch
+          # (+refs/heads/<sha>*)，GitHub 找不到 → `git.exe failed with exit code 1`（2026-10-16 首跑实测）。
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install CUDA ${{ inputs.cuda_version }}
         shell: pwsh
