@@ -180,6 +180,20 @@ jobs:
           else { "MISSING: $tree" }
           Get-ChildItem "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET\lib" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 
+      # 全量 build 目录缓存（比 sccache 更进一步：nvcc 编出的 CUDA .obj 也缓存）。
+      # 热 run（同 commit）= restore 后 ninja 判定 no work to do → 只剩依赖下载+链接（~20-30 分钟）。
+      # 冷 run 时 restore 落空，行为与无缓存完全一致。CMakeCache/ninja 图按路径+内容哈希追踪，
+      # GHA workspace 路径（D:\a\ninfer-all\ninfer-all）跨 run 固定；镜像 toolchain 变了
+      # CMake 会自动重配置 → 最坏退回全量，不会编坏。
+      - name: Restore build directory
+        uses: actions/cache/restore@v4
+        with:
+          path: build
+          key: build-sm89-${{ matrix.scope }}-${{ github.sha }}
+          restore-keys: |
+            build-sm89-${{ matrix.scope }}-
+            build-sm89-
+
       - name: Configure
         shell: pwsh
         run: |
@@ -209,16 +223,25 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
-          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
-          # 防静默失效：launcher 没生效时 sccache 不会写缓存，构建照常全量编译、看起来一切正常
-          $stats = (& sccache --show-stats) -join "`n"
-          $stats
-          if ($stats -notmatch 'Cache misses\s+[1-9]') { throw "sccache wrote nothing to the cache: the CMAKE_*_COMPILER_LAUNCHER hook is not working" }
-          # 防"缓存了但依赖没跟踪"：sccache 靠 /showIncludes 解析 MSVC 依赖；缺了它缓存命中时
-          # 改头文件不触发重编 → 热缓存 run 可能编出陈旧对象。这里强制失败，别把风险留到下次
-          $cmds = (& ninja -C build -t commands) -join "`n"
-          if ($cmds -notmatch '/showIncludes') { throw "MSVC cl invocations lack /showIncludes: sccache cannot track dependencies; warm-cache builds would be unsafe" }
+          # 探活：restore 来的 build 目录若与当前源码一致，ninja 无事可做 → 跳过编译与 sccache 自检
+          $probe = (& ninja -C build -n) -join "`n"
+          $willCompile = $probe -match '(Building CXX object|Building CUDA object)'
+          if ($probe -match 'no work to do') {
+            "warm build: no work to do (restored build dir is up to date)"
+          } else {
+            cmake --build build --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+            if ($willCompile) {
+              # 防静默失效：launcher 没生效时 sccache 不会写缓存，构建照常全量编译、看起来一切正常
+              $stats = (& sccache --show-stats) -join "`n"
+              $stats
+              if ($stats -notmatch 'Cache misses\s+[1-9]') { throw "sccache wrote nothing to the cache: the CMAKE_*_COMPILER_LAUNCHER hook is not working" }
+              # 防"缓存了但依赖没跟踪"：sccache 靠 /showIncludes 解析 MSVC 依赖；缺了它缓存命中时
+              # 改头文件不触发重编 → 热缓存 run 可能编出陈旧对象。这里强制失败，别把风险留到下次
+              $cmds = (& ninja -C build -t commands) -join "`n"
+              if ($cmds -notmatch '/showIncludes') { throw "MSVC cl invocations lack /showIncludes: sccache cannot track dependencies; warm-cache builds would be unsafe" }
+            }
+          }
 
       - name: Save sccache cache
         if: ${{ !cancelled() }}
@@ -226,6 +249,13 @@ jobs:
         with:
           path: D:\sccache-cache
           key: sccache-sm89-${{ matrix.scope }}-${{ github.sha }}
+
+      - name: Save build directory
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: build
+          key: build-sm89-${{ matrix.scope }}-${{ github.sha }}
 
       - name: Stage artifact
         shell: pwsh
