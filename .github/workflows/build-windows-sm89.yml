@@ -37,12 +37,11 @@ jobs:
     name: ${{ matrix.scope }} (sm_89, CUDA ${{ inputs.cuda_short }})
     runs-on: windows-2022
     timeout-minutes: 240
-    # targets 输入可以只跑一半（apps 与 bench 互不依赖；apps 那半需要 CURL，bench 那半不需要）
-    if: inputs.targets == 'both' || inputs.targets == matrix.scope
     strategy:
       fail-fast: false
+      # ⚠️ job 级 if 不能用 matrix（GitHub 报 Unrecognized named-value: 'matrix'）→ 改用动态矩阵
       matrix:
-        scope: [apps, bench]
+        scope: ${{ fromJSON(inputs.targets == 'apps' && '["apps"]' || inputs.targets == 'bench' && '["bench"]' || '["apps","bench"]') }}
     steps:
       - uses: actions/checkout@v7
         with:
