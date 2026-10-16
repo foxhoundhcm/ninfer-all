@@ -26,12 +26,19 @@ on:
         description: branch, tag or FULL 40-char SHA to build (blank = the commit that triggered this run)
         default: ''
         type: string
+      targets:
+        description: which binaries to build (apps | bench | both)
+        default: both
+        type: choice
+        options: [both, apps, bench]
 
 jobs:
   build:
     name: ${{ matrix.scope }} (sm_89, CUDA ${{ inputs.cuda_short }})
     runs-on: windows-2022
     timeout-minutes: 240
+    # targets 输入可以只跑一半（apps 与 bench 互不依赖；apps 那半需要 CURL，bench 那半不需要）
+    if: inputs.targets == 'both' || inputs.targets == matrix.scope
     strategy:
       fail-fast: false
       matrix:
