@@ -1,0 +1,162 @@
+# 草稿：待用户点头后放进 fork（foxhoundhcm/ninfer-all）的 .github/workflows/ 下再推。
+# 设计要点（与本机配方一致，见 docs/llama-server-params/ninfer-all-sm89-selfbuild-20261005.md）：
+#  · 一个 workflow + matrix{apps, bench} = 两条独立 job（各自 runner、各自产物、互不阻塞）
+#  · apps job 出 ninfer-serve.exe 等 5 个 app（ninfer.exe 与它同属 NINFER_BUILD_APPS，分不开）
+#  · bench job 出 bench/ninfer_bench.exe + ninfer_benches.exe（NINFER_BUILD_APPS=OFF + NINFER_BUILD_BENCHMARKS=ON）
+#  · ⚠️ 上游 CI 的依赖用“空 .lib”stub（他们只编 host 代码、不链接）；我们真链接，故这里从 DLL 导出表现场造真 MSVC import lib
+#  · CUDA 钉 13.1.0（与本机 nvcc 13.1.115 同源）；URL 已实测存在（13.1.1/13.1.2 是 404）
+name: Build ninfer-all for RTX 4090 (sm_89, Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: CUDA toolkit version directory (e.g. 13.1.0)
+        default: '13.1.0'
+        type: string
+      cuda_short:
+        description: CUDA short version (e.g. 13.1)
+        default: '13.1'
+        type: string
+      cuda_installer:
+        description: network installer file name
+        default: 'cuda_13.1.0_windows_network.exe'
+        type: string
+      ref:
+        description: commit/branch to build (blank = the branch this runs on)
+        default: ''
+        type: string
+
+jobs:
+  build:
+    name: ${{ matrix.scope }} (sm_89, CUDA ${{ inputs.cuda_short }})
+    runs-on: windows-2022
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [apps, bench]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install CUDA ${{ inputs.cuda_version }}
+        shell: pwsh
+        run: |
+          $short = '${{ inputs.cuda_short }}'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/${{ inputs.cuda_version }}/network_installers/${{ inputs.cuda_installer }}' -OutFile $installer
+          $packages = 'nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api'.Split(' ') | ForEach-Object { "${_}_$short" }
+          $p = Start-Process -FilePath $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "CUDA installer exited with $($p.ExitCode)" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($f in 'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\crt\host_config.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path -LiteralPath (Join-Path $cuda $f))) { throw "the CUDA install lacks $f" }
+          }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Visual Studio 2022 environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio 2022 with the x64 toolset' }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'VCPKG_ROOT', 'CUDA_PATH') {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+          python -m pip install --quiet ninja
+
+      # 依赖 shim：cmake/Dependencies.cmake 与 FindFFMPEG 把 VCPKG_ROOT + VCPKG_TARGET_TRIPLET 当硬前提，
+      # 且只在该布局下找 av*.lib / 头文件 / DLL。FFmpeg 与 curl 的 MSVC import lib 从各自 DLL 的导出表现场造
+      # （curl.se 只发 mingw 包、MSVC 链不了 .dll.a；BtbN 的 ffmpeg 包同理）。
+      - name: FFmpeg, curl and zlib into a vcpkg-shaped tree
+        shell: pwsh
+        run: |
+          $deps = Join-Path $env:RUNNER_TEMP 'deps'
+          $triplet = 'x64-windows-msvc'
+          $tree = Join-Path $deps "installed\$triplet"
+          New-Item -ItemType Directory -Force -Path "$tree\include", "$tree\lib", "$tree\bin" | Out-Null
+
+          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip' -OutFile "$deps\ffmpeg.zip"
+          Expand-Archive -Path "$deps\ffmpeg.zip" -DestinationPath $deps
+          $ff = (Get-ChildItem -Path $deps -Directory -Filter 'ffmpeg-*' | Select-Object -First 1).FullName
+          Copy-Item -Recurse -Path "$ff\include\*" -Destination "$tree\include"
+          Copy-Item -Path "$ff\bin\*.dll" -Destination "$tree\bin"
+
+          Invoke-WebRequest -Uri 'https://curl.se/windows/latest.cgi?p=win64-mingw.zip' -OutFile "$deps\curl.zip"
+          Expand-Archive -Path "$deps\curl.zip" -DestinationPath $deps
+          $curl = (Get-ChildItem -Path $deps -Directory -Filter 'curl-*' | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force -Path "$tree\include\curl" | Out-Null
+          Copy-Item -Recurse -Path "$curl\include\*" -Destination "$tree\include\curl"
+          Copy-Item -Path "$curl\bin\libcurl-x64.dll" -Destination "$tree\bin"
+
+          function New-MsvcImportLib([string]$dll, [string]$outLib) {
+            $names = & dumpbin /nologo /exports $dll | ForEach-Object {
+              if ($_ -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)\s*$') { $Matches[1] }
+            } | Where-Object { $_ }
+            if (-not $names) { throw "no exports parsed from $dll" }
+            $defPath = [IO.Path]::ChangeExtension($outLib, '.def')
+            [IO.File]::WriteAllText($defPath, "LIBRARY $(Split-Path $dll -Leaf)`nEXPORTS`n" + ($names -join "`n") + "`n")
+            & lib /nologo "/DEF:$defPath" "/OUT:$outLib" /MACHINE:X64
+            if ($LASTEXITCODE -ne 0) { throw "lib.exe failed for $dll" }
+          }
+          foreach ($name in 'avformat', 'avcodec', 'avutil', 'swscale', 'swresample', 'avfilter', 'avdevice') {
+            $dll = (Get-ChildItem -Path "$ff\bin" -Filter "$name-*.dll" | Select-Object -First 1).FullName
+            New-MsvcImportLib $dll "$tree\lib\$name.lib"
+          }
+          New-MsvcImportLib "$curl\bin\libcurl-x64.dll" "$tree\lib\libcurl.lib"
+
+          # zlib：先放空 stub（本机实测 avformat 动态链接、无 inflate 引用）；若链接报未解析符号再改成真编 zlib 1.3.1
+          New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null
+
+          "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_TARGET_TRIPLET=$triplet" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-ChildItem "$tree\lib" | Select-Object -ExpandProperty Name
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $flags = @()
+          if ('${{ matrix.scope }}' -eq 'apps') {
+            $flags += '-DNINFER_BUILD_APPS=ON', '-DNINFER_BUILD_BENCHMARKS=OFF'
+          } else {
+            $flags += '-DNINFER_BUILD_APPS=OFF', '-DNINFER_BUILD_BENCHMARKS=ON'
+          }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=89 "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
+            -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DBUILD_TESTING=OFF `
+            -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=OFF -DCMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES=OFF `
+            @flags
+          if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse --short HEAD)
+          $out = "dist/ninfer-sm89-$sha-${{ matrix.scope }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          if ('${{ matrix.scope }}' -eq 'apps') {
+            Copy-Item -Path 'build/apps/*.exe' -Destination $out
+          } else {
+            Copy-Item -Path 'build/bench/*.exe' -Destination $out
+          }
+          Copy-Item -Path "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET\bin\*.dll" -Destination $out
+          Get-ChildItem $out -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Out-File -FilePath "$out/SHA256SUMS.txt" -Encoding ascii
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ninfer-sm89-${{ matrix.scope }}-${{ github.sha }}
+          path: dist/
+          retention-days: 30
