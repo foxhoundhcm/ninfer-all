@@ -181,18 +181,19 @@ jobs:
           Get-ChildItem "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET\lib" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 
       # 全量 build 目录缓存（比 sccache 更进一步：nvcc 编出的 CUDA .obj 也缓存）。
-      # 热 run（同 commit）= restore 后 ninja 判定 no work to do → 只剩依赖下载+链接（~20-30 分钟）。
-      # 冷 run 时 restore 落空，行为与无缓存完全一致。CMakeCache/ninja 图按路径+内容哈希追踪，
-      # GHA workspace 路径（D:\a\ninfer-all\ninfer-all）跨 run 固定；镜像 toolchain 变了
-      # CMake 会自动重配置 → 最坏退回全量，不会编坏。
+      # 热 run（同 commit + 同 CUDA）= restore 后 ninja 判定 no work to do → 只剩依赖下载+链接（~20-30 分钟）。
+      # 冷 run 时 restore 落空，行为与无缓存完全一致。
+      # ⚠️ key 必须含 CUDA 版本（2026-10-17 补）：CMAKE_CUDA_COMPILER 变了 ninja 只重编
+      # CUDA 对象；C++ 对象命令行不变 → 依赖的 cuda 头文件 13.1↔13.4 差异不触发重编
+      # （cache 解压保留 mtime，ninja 视 dep 为最新）→ 同 sha 跨 CUDA 恢复 = 静默混编。
+      # 代价：换 CUDA 版本后该 key 冷一次。旧无后缀 key 故意不回落（会跨 CUDA 命中）。
       - name: Restore build directory
         uses: actions/cache/restore@v4
         with:
           path: build
-          key: build-sm89-${{ matrix.scope }}-${{ github.sha }}
+          key: build-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-${{ github.sha }}
           restore-keys: |
-            build-sm89-${{ matrix.scope }}-
-            build-sm89-
+            build-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-
 
       - name: Configure
         shell: pwsh
@@ -215,10 +216,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: D:\sccache-cache
-          key: sccache-sm89-${{ matrix.scope }}-${{ github.sha }}
+          key: sccache-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-${{ github.sha }}
           restore-keys: |
-            sccache-sm89-${{ matrix.scope }}-
-            sccache-sm89-
+            sccache-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-
 
       - name: Build
         shell: pwsh
@@ -248,20 +248,20 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: D:\sccache-cache
-          key: sccache-sm89-${{ matrix.scope }}-${{ github.sha }}
+          key: sccache-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-${{ github.sha }}
 
       - name: Save build directory
         if: ${{ !cancelled() }}
         uses: actions/cache/save@v4
         with:
           path: build
-          key: build-sm89-${{ matrix.scope }}-${{ github.sha }}
+          key: build-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-${{ github.sha }}
 
       - name: Stage artifact
         shell: pwsh
         run: |
           $sha = (git rev-parse --short HEAD)
-          $out = "dist/ninfer-sm89-$sha-${{ matrix.scope }}"
+          $out = "dist/ninfer-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-$sha"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           if ('${{ matrix.scope }}' -eq 'apps') {
             Copy-Item -Path 'build/apps/*.exe' -Destination $out
@@ -294,6 +294,6 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ninfer-sm89-${{ matrix.scope }}-${{ github.sha }}
+          name: ninfer-sm89-${{ matrix.scope }}-cuda${{ inputs.cuda_short }}-${{ github.sha }}
           path: dist/
           retention-days: 30
